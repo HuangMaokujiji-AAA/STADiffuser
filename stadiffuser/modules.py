@@ -88,17 +88,17 @@ class SelfAttention(nn.Module):
         self.key_projection = nn.Linear(hidden_size, hidden_size)
         self.value_projection = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, x):
+    def forward(self, x, query_batch_size=None):
         query = self.query_projection(x)
-        key = self.key_projection(x)
+        keys = self.key_projection(x).transpose(-2, -1)
         value = self.value_projection(x)
-
-        attention_scores = torch.matmul(query, key.transpose(-2, -1)) / torch.sqrt(
-            torch.tensor(self.hidden_size).float())
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        attended_values = torch.matmul(attention_weights, value)
-
-        return attended_values
+        queries = (query,) if query_batch_size is None else query.split(query_batch_size, dim=-2)
+        # Split queries for inference while keeping every key in the attention.
+        outputs = [
+            F.softmax(torch.matmul(chunk, keys) / self.hidden_size ** 0.5, dim=-1) @ value
+            for chunk in queries
+        ]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-2)
 
 
 class EncoderAttnBlock(nn.Module):
@@ -148,8 +148,8 @@ class DecoderAttnBlock(nn.Module):
             nn.Linear(hidden_dim, in_dim)
         )
 
-    def forward(self, x):
-        attended_values = self.attention(x)
+    def forward(self, x, query_batch_size=None):
+        attended_values = self.attention(x, query_batch_size=query_batch_size)
         residual1 = x + attended_values
         norm1_output = self.norm1(residual1)
 
