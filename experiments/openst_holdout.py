@@ -20,7 +20,8 @@ except ImportError:  # AnnData 0.10, used by the original environment.
 
 SECTIONS = (2, 3, 4, 5, 6, 7, 9, 11, 17, 18, 19, 23, 24, 25, 26, 28, 33, 34, 36)
 TEST = (4, 9, 18, 24)
-TRAIN = tuple(section for section in SECTIONS if section not in TEST)
+VALIDATION = (6, 34)
+TRAIN = tuple(section for section in SECTIONS if section not in TEST + VALIDATION)
 N_HVG = 2000
 RADIUS = 150
 XY_STEP = 125
@@ -31,6 +32,10 @@ TIMESTEPS = 1000
 SEED = 2024
 LR = 1e-4
 WEIGHT_DECAY = 1e-6
+CHECKPOINT_INTERVAL = 10
+VALIDATION_CELLS = 4096
+EARLY_STOP_WARMUP = 10
+EARLY_STOP_PATIENCE = {"autoencoder": 10, "denoiser": 12}
 DEFAULT_INPUT = Path("data/Open-ST/GSE251926_metastatic_lymph_node_3d.h5ad")
 
 
@@ -96,6 +101,12 @@ def quantize(xyz, origin, steps):
     return coord
 
 
+def write_protocol(output, protocol):
+    temporary = output / "run.json.tmp"
+    temporary.write_text(json.dumps(protocol, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(output / "run.json")
+
+
 def decode_section(autoencoder, latent, graph, device):
     """Apply the complete section decoder with bounded attention and GAT memory."""
     import torch
@@ -121,32 +132,17 @@ def decode_section(autoencoder, latent, graph, device):
     return state.numpy()
 
 
-def run_models(matrix, rows, xyz, coord, names, genes, var, protocol, log_base, output, device, smoke):
+def graph_data(matrix, rows, sections, xyz, coord, genes):
     import torch
-    from diffusers import DDPMScheduler
     from torch_geometric.data import Data
-    from torch_geometric.loader import NeighborLoader
-    from stadiffuser import SpaAE, SpaUNet1DModel, pipeline
-    from stadiffuser.utils import MinMaxNormalize
 
-    torch.manual_seed(SEED)
-    model_rows = rows
-    if smoke:
-        # Use a compact patch per section to exercise real graph edges on CPU.
-        rng = np.random.default_rng(SEED)
-        model_rows = {}
-        for section, positions in rows.items():
-            xy = xyz[positions, :2]
-            _, local = cKDTree(xy).query(xy[rng.integers(len(xy))], k=min(48, len(xy)))
-            model_rows[section] = positions[np.sort(np.atleast_1d(local))]
-
-    train_rows = np.concatenate([model_rows[section] for section in TRAIN])
-    x = np.empty((len(train_rows), len(genes)), dtype=np.float32)
+    selected = np.concatenate([rows[section] for section in sections])
+    x = np.empty((len(selected), len(genes)), dtype=np.float32)
     graphs = []
     offset = 0
-    for section in TRAIN:
-        positions = model_rows[section]
-        print(f"Loading training section #{section} ({len(positions):,} cells)", flush=True)
+    for section in sections:
+        positions = rows[section]
+        print(f"Loading section #{section} ({len(positions):,} cells)", flush=True)
         for start in range(0, len(positions), 4096):
             chunk = positions[start:start + 4096]
             read_rows(matrix, chunk)[:, genes].astype(np.float32, copy=False).toarray(
@@ -157,45 +153,208 @@ def run_models(matrix, rows, xyz, coord, names, genes, var, protocol, log_base, 
     graph = sparse.block_diag(graphs, format="csr")
     dest = np.repeat(np.arange(graph.shape[0], dtype=graph.indices.dtype), np.diff(graph.indptr))
     edges = torch.from_numpy(np.vstack((graph.indices, dest))).long()
-    del graph, dest, graphs
-    data = Data(x=torch.from_numpy(x), edge_index=edges, spatial=torch.from_numpy(coord[train_rows]))
-    del x, edges
+    return Data(x=torch.from_numpy(x), edge_index=edges, spatial=torch.from_numpy(coord[selected]))
+
+
+def encode_batch(model, batch):
+    state = batch.x
+    for layer in model.in_gat:
+        state = layer(state, batch.edge_index)
+    for layer in model.encoder:
+        state = layer(state)
+    return state[:batch.batch_size]
+
+
+class StageValidation:
+    """Validate at epoch boundaries and retain the minimum-loss model."""
+
+    def __init__(self, output, stage, score):
+        self.stage = stage
+        self.score = score
+        self.directory = output / "checkpoints"
+        self.directory.mkdir(exist_ok=True)
+        self.metrics = output / f"{stage}_validation.jsonl"
+        self.best_path = self.directory / f"{stage}_best.pt"
+        self.patience = EARLY_STOP_PATIENCE[stage]
+        self.history = []
+        self.best = float("inf")
+        self.min_delta = None
+        self.stale = 0
+
+    def __call__(self, epoch, model):
+        import torch
+
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                by_section = self.score(model)
+        finally:
+            model.train(was_training)
+        loss = float(np.mean(list(by_section.values())))
+        if not np.isfinite(loss):
+            raise ValueError(f"Nonfinite {self.stage} validation loss at epoch {epoch}")
+        self.history.append(loss)
+        paths = []
+        if epoch % CHECKPOINT_INTERVAL == 0:
+            paths.append(self.directory / f"{self.stage}_epoch_{epoch:04d}.pt")
+        if loss < self.best:
+            self.best = loss
+            self.best_epoch = epoch
+            paths.append(self.best_path)
+        for path in paths:
+            temporary = path.with_suffix(".pt.tmp")
+            torch.save({"epoch": epoch, "validation_mse": loss, "model": model.state_dict()}, temporary)
+            temporary.replace(path)
+
+        if len(self.history) == EARLY_STOP_WARMUP:
+            self.anchor = self.best
+            jitter = float(np.median(np.abs(np.diff(self.history, n=2)))) / 2
+            self.min_delta = float(np.clip(jitter, 0.001 * self.anchor, 0.005 * self.anchor))
+        elif self.min_delta is not None:
+            if self.anchor - loss > self.min_delta:
+                self.anchor = loss
+                self.stale = 0
+            else:
+                self.stale += 1
+        stop = self.stale >= self.patience
+        record = dict(epoch=epoch, validation_mse=loss, by_section=by_section, best_epoch=self.best_epoch,
+                      best_validation_mse=self.best, min_delta=self.min_delta, patience=self.patience,
+                      stale_epochs=self.stale, early_stop=stop)
+        with self.metrics.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, allow_nan=False) + "\n")
+        print(f"{self.stage} validation {json.dumps(record)}", flush=True)
+        return stop
+
+    def restore(self, model):
+        import torch
+
+        model.load_state_dict(torch.load(self.best_path, map_location="cpu")["model"])
+        record = {"last_epoch": len(self.history), "best_epoch": self.best_epoch, "best_mse": self.best,
+                  "patience": self.patience, "early_stop": self.stale >= self.patience}
+        if self.min_delta is not None:
+            record["min_delta"] = self.min_delta
+        return record
+
+
+def run_models(matrix, rows, xyz, coord, names, genes, var, protocol, log_base, output, device, smoke,
+               *, prediction_protocol_key="openst_holdout", resume_predictions=False):
+    import torch
+    from diffusers import DDPMScheduler
+    from torch_geometric.loader import NeighborLoader
+    from stadiffuser import SpaAE, SpaUNet1DModel, pipeline
+    from stadiffuser.utils import MinMaxNormalize
+
+    torch.manual_seed(SEED)
+    rng = np.random.default_rng(SEED)
+    model_rows = rows
+    if smoke:
+        # Use a compact patch per section to exercise real graph edges on CPU.
+        model_rows = {}
+        for section, positions in rows.items():
+            xy = xyz[positions, :2]
+            _, local = cKDTree(xy).query(xy[rng.integers(len(xy))], k=min(48, len(xy)))
+            model_rows[section] = positions[np.sort(np.atleast_1d(local))]
+
+    data = graph_data(matrix, model_rows, TRAIN, xyz, coord, genes)
+    validation = {}
+    for section in VALIDATION:
+        graph = graph_data(matrix, model_rows, [section], xyz, coord, genes)
+        seeds = np.sort(rng.choice(graph.num_nodes, min(VALIDATION_CELLS, graph.num_nodes), replace=False))
+        validation[section] = NeighborLoader(graph, input_nodes=torch.from_numpy(seeds.astype(np.int64)),
+                                             num_neighbors=NEIGHBORS, batch_size=AE_BATCH, is_sorted=True)
+    del graph
+    torch_device = torch.device(device)
+    cuda_devices = [torch_device.index if torch_device.index is not None else torch.cuda.current_device()] \
+        if torch_device.type == "cuda" else []
+
+    def ae_score(model):
+        scores = {}
+        with torch.random.fork_rng(devices=cuda_devices):
+            for section, loader in validation.items():
+                torch.manual_seed(SEED + section)
+                total, count = 0.0, 0
+                for batch in loader:
+                    batch = batch.to(device)
+                    _, recon = model(batch.x, batch.edge_index)
+                    n = batch.batch_size
+                    total += (recon[:n] - batch.x[:n]).square().mean(dim=1).sum().item()
+                    count += n
+                scores[section] = total / count
+        return scores
 
     autoencoder = SpaAE(input_dim=len(genes), gat_dim=[512, 32], block_out_dims=[32, 32]).to(device)
     ae_loader = NeighborLoader(data, num_neighbors=NEIGHBORS, batch_size=AE_BATCH, is_sorted=True)
+    ae_validation = StageValidation(output, "autoencoder", ae_score)
     print("Training the spatial autoencoder", flush=True)
     pipeline.train_autoencoder(ae_loader, autoencoder, n_epochs=protocol["autoencoder_epochs"],
-                               lr=LR, weight_decay=WEIGHT_DECAY, device=device)
+                               lr=LR, weight_decay=WEIGHT_DECAY, device=device, epoch_end=ae_validation)
+    protocol["autoencoder_result"] = ae_validation.restore(autoencoder)
+    write_protocol(output, protocol)
 
     autoencoder.eval()
-    latent = np.empty((len(train_rows), 32), dtype=np.float32)
+    latent = np.empty((data.num_nodes, 32), dtype=np.float32)
     with torch.no_grad():
         for batch in tqdm(ae_loader, desc="Encoding training cells"):
             batch = batch.to(device)
-            state = batch.x
-            for layer in autoencoder.in_gat:
-                state = layer(state, batch.edge_index)
-            for layer in autoencoder.encoder:
-                state = layer(state)
-            latent[batch.n_id[:batch.batch_size].cpu().numpy()] = state[:batch.batch_size].cpu().numpy()
+            latent[batch.n_id[:batch.batch_size].cpu().numpy()] = encode_batch(autoencoder, batch).cpu().numpy()
     del ae_loader, batch
     normalizer = MinMaxNormalize(latent, dim=0)
     normalizer.max = np.maximum(normalizer.max, normalizer.min + 1e-8)
     data.x = torch.from_numpy(normalizer.normalize(latent).astype(np.float32))
+    np.savez(output / "checkpoints/latent_normalizer.npz", minimum=normalizer.min, maximum=normalizer.max)
     del latent
+
+    valid_noise = {}
+    val_scheduler = DDPMScheduler(num_train_timesteps=TIMESTEPS)
+    with torch.no_grad(), torch.random.fork_rng(devices=cuda_devices):
+        for section, loader in validation.items():
+            torch.manual_seed(SEED + section)
+            z, coords = [], []
+            for batch in loader:
+                batch = batch.to(device)
+                z.append(encode_batch(autoencoder, batch).cpu().numpy())
+                coords.append(batch.spatial[:batch.batch_size])
+            clean = torch.as_tensor(normalizer.normalize(np.concatenate(z)), dtype=torch.float32, device=device)
+            clean = clean.unsqueeze(1)
+            noise = torch.randn_like(clean)
+            time = torch.randint(TIMESTEPS, (len(clean),), device=device)
+            valid_noise[section] = val_scheduler.add_noise(clean, noise, time), time, torch.cat(coords), noise
+    del validation, loader, batch
+
+    def denoiser_score(model):
+        scores = {}
+        for section, (noisy, time, coords, noise) in valid_noise.items():
+            total = 0.0
+            for i in range(0, len(noise), DIFFUSION_BATCH):
+                batch = slice(i, i + DIFFUSION_BATCH)
+                pred = model(noisy[batch], time[batch], coords[batch]).sample
+                total += (pred - noise[batch]).square().mean(dim=(1, 2)).sum().item()
+            scores[section] = total / len(noise)
+        return scores
 
     denoiser = SpaUNet1DModel(in_channels=18, out_channels=1, spatial_encoding="sinusoidal3d",
                               spatial3d_concat=True).to(device)
     diffusion_loader = NeighborLoader(data, num_neighbors=NEIGHBORS, batch_size=DIFFUSION_BATCH, is_sorted=True)
+    diffusion_validation = StageValidation(output, "denoiser", denoiser_score)
     print("Training the 3D diffusion model", flush=True)
     pipeline.train_denoiser(diffusion_loader, denoiser, DDPMScheduler(num_train_timesteps=TIMESTEPS),
                             n_epochs=protocol["diffusion_epochs"], lr=LR, weight_decay=WEIGHT_DECAY,
-                            device=device)
+                            device=device, epoch_end=diffusion_validation)
+    protocol["denoiser_result"] = diffusion_validation.restore(denoiser)
+    write_protocol(output, protocol)
+    valid_noise.clear()
     del diffusion_loader, data
     denoiser.eval()
-    torch.manual_seed(SEED)
+    if not resume_predictions:
+        torch.manual_seed(SEED)
 
     for section in TEST:
+        path = output / f"predicted_section_{section:02d}.h5ad"
+        if resume_predictions:
+            if path.is_file():
+                continue
+            torch.manual_seed(SEED)
         positions = model_rows[section]
         z = np.empty((len(positions), denoiser.sample_size), dtype=np.float32)
         batches = range(0, len(positions), DIFFUSION_BATCH)
@@ -216,11 +375,10 @@ def run_models(matrix, rows, xyz, coord, names, genes, var, protocol, log_base, 
         pred.obsm["spatial"] = section_xyz[:, :2]
         pred.obsm["spatial_3d_aligned"] = section_xyz
         pred.obsm["latent"] = z
-        pred.uns["openst_holdout"] = protocol
+        pred.uns[prediction_protocol_key] = protocol
         pred.uns["log1p"] = {"base": log_base}
-        path = output / f"predicted_section_{section:02d}.h5ad"
         temporary = path.with_suffix(".tmp.h5ad")
-        pred.write_h5ad(temporary, compression="gzip")
+        pred.write_h5ad(temporary, compression="lzf" if resume_predictions else "gzip")
         temporary.replace(path)
         print(f"Saved {path} ({pred.n_obs:,} cells x {pred.n_vars:,} genes)", flush=True)
         del pred, values
@@ -266,22 +424,29 @@ def run(args):
         var.to_csv(args.output_dir / "hvg.csv", index_label="gene")
         pd.DataFrame({
             "n_section": SECTIONS, "z_um": heights, "n_cells": [len(rows[s]) for s in SECTIONS],
-            "split": ["test" if s in TEST else "train" for s in SECTIONS],
+            "split": ["test" if s in TEST else "validation" if s in VALIDATION else "train" for s in SECTIONS],
         }).to_csv(args.output_dir / "split.csv", index=False)
         protocol = {
-            "train_sections": list(TRAIN), "test_sections": list(TEST),
+            "train_sections": list(TRAIN), "validation_sections": list(VALIDATION), "test_sections": list(TEST),
             "prediction_coordinates": "observed aligned XYZ",
             "expression_scale": "source log1p X", "hvg_flavor": "seurat",
             "hvg_training_cells": sum(len(rows[s]) for s in TRAIN), "n_hvg": len(genes),
             "origin_um": origin.tolist(), "coordinate_step_um": steps.tolist(),
             "graph_radius_um": RADIUS, "neighbor_sampling": NEIGHBORS, "seed": SEED,
             "learning_rate": LR, "weight_decay": WEIGHT_DECAY,
+            "checkpoint_interval_epochs": CHECKPOINT_INTERVAL,
+            "validation_cells_per_section": min(48, VALIDATION_CELLS) if args.smoke else VALIDATION_CELLS,
+            "early_stop_warmup_epochs": EARLY_STOP_WARMUP,
+            "early_stop_patience": EARLY_STOP_PATIENCE,
+            "early_stop_delta_fraction_bounds": [0.001, 0.005],
+            "autoencoder_validation_metric": "reconstruction MSE on the original log1p scale",
+            "denoiser_validation_metric": "fixed-timestep noise prediction MSE in the normalized latent space",
             "autoencoder_epochs": 1 if args.smoke else 500, "autoencoder_batch_size": AE_BATCH,
             "diffusion_epochs": 1 if args.smoke else 1000, "diffusion_batch_size": DIFFUSION_BATCH,
             "inference_steps": 3 if args.smoke else TIMESTEPS, "diffusion_timesteps": TIMESTEPS,
             "smoke": args.smoke, "device": args.device,
         }
-        (args.output_dir / "run.json").write_text(json.dumps(protocol, indent=2) + "\n", encoding="utf-8")
+        write_protocol(args.output_dir, protocol)
         print(f"Selected {len(genes):,} HVGs from {protocol['hvg_training_cells']:,} training cells", flush=True)
         if not args.prepare_only:
             run_models(matrix, rows, xyz, coord, names, genes, var, protocol, log_base,

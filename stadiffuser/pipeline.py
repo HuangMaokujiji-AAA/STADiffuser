@@ -199,7 +199,7 @@ def train_autoencoder(train_loader, model,
                       n_epochs=1000, gradient_clip=5, lr=1e-4, weight_decay=1e-6,
                       save_dir=None, model_name="autoencoder",
                       device="cpu",
-                      check_points=None):
+                      check_points=None, epoch_end=None):
     """
     Train the autoencoder model.
     Parameters
@@ -233,6 +233,8 @@ def train_autoencoder(train_loader, model,
 
     check_points: list
          The epochs to save the model--list of integers.
+    epoch_end: callable
+        Optional callback (epoch, model). Return true to stop after this epoch.
 
     Returns
     -------
@@ -251,7 +253,10 @@ def train_autoencoder(train_loader, model,
     loss_list = []
     pbar = tqdm(range(n_epochs))
     model.train()
-    for epoch in range(1, n_epochs + 1):
+    completed, stopped = (epoch_end.resume(model, optimizer, scheduler)
+                          if hasattr(epoch_end, "resume") else (0, False))
+    pbar.update(completed)
+    for epoch in range(completed + 1, completed + 1 if stopped else n_epochs + 1):
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
@@ -261,12 +266,15 @@ def train_autoencoder(train_loader, model,
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             optimizer.step()
-            pbar.set_description(f"Epoch: {epoch}, Loss: {loss.item():.4f}")
+            pbar.set_description(f"Epoch: {epoch}, Loss: {loss.item():.4f}", refresh=epoch_end is None)
             loss_list.append(loss.item())
         scheduler.step()
         pbar.update(1)
         if check_points is not None and epoch in check_points:
             torch.save(model, os.path.join(save_dir, "{}_{}.pth".format(model_name, epoch)))
+        if epoch_end is not None and epoch_end(epoch, model):
+            break
+    pbar.close()
     if save_dir is not None:
         torch.save(model, os.path.join(save_dir, "{}.pth".format(model_name)))
     return model, loss_list
@@ -422,6 +430,7 @@ def train_denoiser(train_loader,
                    check_points=None,
                    eval_fn=None,
                    eval_kwargs=None,
+                   epoch_end=None,
                    ):
     r"""
     Train the denoising model with the noise scheduler.
@@ -446,6 +455,8 @@ def train_denoiser(train_loader,
         The gradient clip.
     num_class_embeds: int
         The number of class embeddings if None the model is unconditional.
+    epoch_end: callable
+        Optional callback (epoch, model). Return true to stop after this epoch.
 
     Returns
     -------
@@ -461,7 +472,10 @@ def train_denoiser(train_loader,
     else:
         raise NotImplementedError
     loss_list = []
-    for epoch in range(1, n_epochs + 1):
+    completed, stopped = (epoch_end.resume(model, optimizer, lr_scheduler)
+                          if hasattr(epoch_end, "resume") else (0, False))
+    pbar.update(completed)
+    for epoch in range(completed + 1, completed + 1 if stopped else n_epochs + 1):
         for batch_idx, batch in enumerate(train_loader):
             batch = batch.to(device)
             clean_data = batch.x
@@ -480,7 +494,8 @@ def train_denoiser(train_loader,
             # clip gradient
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             optimizer.step()
-            pbar.set_description(f"Epoch: {epoch}, Loss: {loss.item():.4f}, batch_id: {batch_idx}")
+            pbar.set_description(f"Epoch: {epoch}, Loss: {loss.item():.4f}, batch_id: {batch_idx}",
+                                 refresh=epoch_end is None)
         lr_scheduler.step()
         pbar.update(1)
         if eval_fn is not None:
@@ -488,6 +503,9 @@ def train_denoiser(train_loader,
                 eval_fn(model, noise_scheduler, epoch, **eval_kwargs)
         if check_points is not None and epoch in check_points:
             torch.save(model, os.path.join(save_dir, "{}_{}.pth".format(model_name, epoch)))
+        if epoch_end is not None and epoch_end(epoch, model):
+            break
+    pbar.close()
 
     if save_dir is not None:
         if not os.path.exists(save_dir):

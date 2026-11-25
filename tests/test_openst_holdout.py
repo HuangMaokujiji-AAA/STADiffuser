@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import anndata as ad
@@ -27,7 +29,7 @@ class OpenSTHoldoutChecks(unittest.TestCase):
         np.testing.assert_allclose(hvgs["dispersions_norm"], reference.var.iloc[indices]["dispersions_norm"],
                                    rtol=1e-6)
         changed = x.toarray()
-        changed[np.concatenate([rows[section] for section in oh.TEST])] = 40
+        changed[np.concatenate([rows[section] for section in oh.TEST + oh.VALIDATION])] = 40
         new_indices, new_hvgs = oh.select_hvgs(sparse.csr_matrix(changed), rows, var, log_base=2, n_top=20)
         np.testing.assert_array_equal(new_indices, indices)
         pd.testing.assert_frame_equal(new_hvgs, hvgs)
@@ -46,3 +48,24 @@ class OpenSTHoldoutChecks(unittest.TestCase):
         with patch.multiple(oh, AE_BATCH=7, DIFFUSION_BATCH=11):
             actual = oh.decode_section(model, latent.numpy(), graph.tocsr(), "cpu")
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+    def test_periodic_checkpoint_early_stop_and_best_restore(self):
+        import torch
+
+        for stage, patience in oh.EARLY_STOP_PATIENCE.items():
+            with self.subTest(stage=stage), TemporaryDirectory() as directory:
+                model = torch.nn.Linear(1, 1, bias=False)
+                losses = iter([0.5] + [0.6] * (oh.EARLY_STOP_WARMUP + patience - 1))
+                output = Path(directory)
+                validation = oh.StageValidation(output, stage, lambda _: {6: next(losses)})
+                for epoch in range(1, oh.EARLY_STOP_WARMUP + patience + 1):
+                    with torch.no_grad():
+                        model.weight.fill_(epoch)
+                    stop = validation(epoch, model)
+                    self.assertEqual(stop, epoch == oh.EARLY_STOP_WARMUP + patience)
+                    self.assertTrue(model.training)
+                checkpoint = torch.load(output / "checkpoints" / f"{stage}_epoch_0010.pt", map_location="cpu")
+                self.assertEqual(checkpoint["model"]["weight"].item(), 10)
+                result = validation.restore(model)
+                self.assertEqual(result["best_epoch"], 1)
+                self.assertEqual(model.weight.item(), 1)
